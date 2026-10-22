@@ -64,12 +64,38 @@ Wear comes from writes. Reads (even terabytes) do not meaningfully wear NAND.
 | Session/slot save files (`--slot-save-path`) | - | off; would be about 1.2 GB per long conversation |
 | Page file when commit/RAM run out | C: | 1.8 GB during one failed full-RAM start; avoid by not over-committing |
 
+Measured over 40 minutes of continuous benchmark load (Strata, 2.4 GiB RAM tier): E: read 3,953 GB
+(average 1.6 GB/s, peak 5.9 GB/s) and wrote 0.18 GB; the page file took 22 MB. Sustained multi-GB/s reads
+make the drive warm, so keep the S70 Pro's heatsink airflow clear; a larger RAM tier cuts these reads.
+
 Endurance: S70 Pro 1 TB is rated 740 TBW; the 660p 1 TB (C:) about 200 TBW. The model workload adds essentially
 no writes after the download. The main risk is page-file traffic on C: under memory pressure.
 
 Separately, the C: drive showed a constant background write load of about 20-24 MB/s (1.2 GB/min) that was
 present before Strata started and is not attributed to any user process. Identify it with Resource Monitor
 (Disk tab, sort by Write B/sec); at that rate it is about 1.7 TB/day, which matters for a 200 TBW drive.
+
+## Resource use while serving (Coder IQ1_M, 32K context, mapped experts)
+
+| Resource | Use |
+|---|---|
+| VRAM | 11.4 GB for strata.exe (14.3 GB with the desktop); about 2,950 experts cached |
+| RAM | 12.2 GB committed, 5.5 GB working set |
+| CPU | 9 expert-pool workers, one per physical core |
+| Load time | about 30-45 s warm; first start after download about 2 min |
+
+## Alternative backend: Qwen3.8-27B on llama-server
+
+The bridge talks to any OpenAI-compatible server. To use the dense 27B already on E: (faster on this PC while the
+commit limit holds Strata back), stop Strata, run `E:\LLM\start-server.ps1`, and point the config at it:
+
+```json
+{"endpoint": "http://127.0.0.1:1234/v1", "model_id": "qwen3.8-27b", "context": 32768, "output": 4096}
+```
+
+Keep the other keys. `server start/stop` only drive Strata; manage llama-server yourself. Note that this
+llama-server (Vulkan) commits about 22 GB of system RAM besides its 11 GB of VRAM, so it also strains the commit
+limit; it grew the C: page file to 16.5 GB during testing.
 
 ## Files and folders
 
