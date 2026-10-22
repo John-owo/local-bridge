@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+*.log
+*.bak*
+agy-bridge-runs/
+settings.json
+.credentials.json
+bench/results/
+bench/fixtures/explore_q/agy-bridge/
+local-bridge/local-bridge.config.json
+local-bridge-runs/
