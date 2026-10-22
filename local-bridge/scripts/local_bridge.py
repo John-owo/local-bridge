@@ -64,12 +64,13 @@ class BridgeError(Exception):
 
 
 def emit(data: dict, code: int = 0) -> int:
-    print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(data, ensure_ascii=True, sort_keys=True))
     return code
 
 
 def write_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # ASCII escapes keep the files readable by Windows PowerShell 5.1, which assumes the ANSI code page.
+    path.write_text(json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:

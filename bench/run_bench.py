@@ -71,15 +71,24 @@ def case_bugfix(tier: str) -> dict:
             "in place so the function honours the docstring for unsorted input, touching intervals, contained intervals "
             "and empty input, and does not mutate its argument. No shell commands are available, so reason carefully.")
     summary, result, run_dir = dispatch(FIX / "bugfix", ["interval.py"], task, tier, mode="write")
-    hidden = subprocess.run([sys.executable, str(FIX / "bugfix" / "test_interval_hidden.py"), str(run_dir / "workspace")],
-                            capture_output=True, text=True, stdin=subprocess.DEVNULL)
-    ran = re.search(r"Ran (\d+) test", hidden.stderr)
-    failed = re.search(r"failures=(\d+)", hidden.stderr)
-    errors = re.search(r"errors=(\d+)", hidden.stderr)
-    total = int(ran.group(1)) if ran else 5
-    bad = (int(failed.group(1)) if failed else 0) + (int(errors.group(1)) if errors else 0)
-    if not ran:
-        bad = total
+    return hidden_tests(FIX / "bugfix" / "test_interval_hidden.py", run_dir, summary, result)
+
+
+def case_hard(tier: str) -> dict:
+    task = ("lru.py implements LRUCache; its class docstring is the contract. The implementation has several bugs. "
+            "Fix every deviation from the contract in place, keeping the public API. No shell commands are available, "
+            "so trace each rule of the contract against the code carefully. List each bug you fixed.")
+    summary, result, run_dir = dispatch(FIX / "hard", ["lru.py"], task, tier, mode="write")
+    return hidden_tests(FIX / "hard" / "test_lru_hidden.py", run_dir, summary, result)
+
+
+def hidden_tests(test: Path, run_dir: Path, summary: dict, result: dict) -> dict:
+    done = subprocess.run([sys.executable, str(test), str(run_dir / "workspace")], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    ran = re.search(r"Ran (\d+) test", done.stderr)
+    failed = re.search(r"failures=(\d+)", done.stderr)
+    errors = re.search(r"errors=(\d+)", done.stderr)
+    total = int(ran.group(1)) if ran else 1
+    bad = (int(failed.group(1)) if failed else 0) + (int(errors.group(1)) if errors else 0) if ran else total
     return {"score": (total - bad) / total, "detail": {"hidden_tests": total, "failed": bad}, **pick(summary, result)}
 
 
@@ -141,7 +150,7 @@ def pick(summary: dict, result: dict) -> dict:
             "tool_errors": sum(1 for t in result.get("tool_calls", []) if t.get("status") == "error")}
 
 
-CASES = {"review": case_review, "bugfix": case_bugfix, "testgen": case_testgen, "explore": case_explore}
+CASES = {"review": case_review, "bugfix": case_bugfix, "testgen": case_testgen, "explore": case_explore, "hard": case_hard}
 
 
 def main() -> int:

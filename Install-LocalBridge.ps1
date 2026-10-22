@@ -5,9 +5,11 @@ param(
     [string]$DataRoot = (Join-Path $env:USERPROFILE 'Documents\Codex'),
     [string]$Endpoint = 'http://127.0.0.1:8080/v1',
     [string]$Strata = (Join-Path $env:LOCALAPPDATA 'Strata\terminal\current\bin\strata.cmd'),
-    # Arguments for `strata launch` used by `local_bridge.py server start`.
-    [string[]]$LaunchArgs = @('--family', 'coder', '--model', 'iq1_m', '--context', '64k', '--vision', 'off', '--access', 'local', '--port', '8080'),
-    [int]$Context = 65536
+    # Arguments for `strata launch` used by `local_bridge.py server start`. Mapped experts with a RAM budget:
+    # the full in-RAM arena (about 23 GiB for Coder IQ1_M) does not fit next to a normal desktop in 40 GB.
+    [string[]]$LaunchArgs = @('--family', 'coder', '--model', 'iq1_m', '--context', '32k', '--vision', 'off', '--access', 'local', '--port', '8080',
+                              '--set', 'mmap-experts', '--set', 'resident-budget-gib=12'),
+    [int]$Context = 32768
 )
 $ErrorActionPreference = 'Stop'
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
