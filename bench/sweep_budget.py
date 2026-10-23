@@ -55,6 +55,7 @@ def counters() -> dict:
 
 def engine_facts() -> dict:
     text = ENGINE_LOG.read_text(encoding="utf-8", errors="replace") if ENGINE_LOG.is_file() else ""
+    text = text.rsplit("engine started:", 1)[-1]  # the log is appended across starts; keep the latest
     facts = {}
     for key, pattern in {
         "ram_tier_gib": r"resident RAM mode: ([\d.]+) GiB of experts in RAM",

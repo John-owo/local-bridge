@@ -149,6 +149,8 @@ class EventTests(unittest.TestCase):
         self.assertEqual(len(denied["denied_actions"]), 1)
         self.assertEqual(bridge.classify(denied, 0, False)[0], "PARTIAL_DENIED")
         self.assertEqual(bridge.classify(bridge.parse_events(event("step_start")), 0, False)[0], "FAILED_OUTPUT")
+        unparsed = bridge.parse_events(event("text", text="<tool_call>\n<function=list>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>"))
+        self.assertEqual(bridge.classify(unparsed, 0, False), ("FAILED_OUTPUT", "Worker ended with an unparsed tool call instead of an answer"))
         errored = bridge.parse_events(json.dumps({"type": "error", "error": {"name": "APIError"}}))
         self.assertEqual(bridge.classify(errored, 1, False)[0], "FAILED_CHILD")
         self.assertEqual(bridge.classify(denied, 0, True)[0], "FAILED_TIMEOUT")

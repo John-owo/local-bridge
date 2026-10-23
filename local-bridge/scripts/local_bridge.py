@@ -49,13 +49,16 @@ SECRET_PARTS = ("credential", "secret", "private", "token", "apikey", "api_key",
 # Tier -> (reasoning effort variant, agent step cap). The local model thinks slowly; keep routine work shallow.
 TIERS = {"routine": ("low", 40), "standard": ("medium", 80), "complex": ("high", 120)}
 DENIAL_MARKERS = ("prevents you from using this specific tool call", "auto-rejecting", "permission denied", "rejected permission")
+# Tool-call markup that reached the answer as text: the server did not parse it (often a tool the request never declared).
+UNPARSED_TOOL_CALL = ("<tool_call>", "<function=", "</tool_call>")
 WORKER_PREAMBLE = (
     "You are an isolated worker running on a local model. Your workspace is the current directory: a copy of "
     "selected project files. Work only inside it. Do not access credentials, the network, the original project, "
-    "or paths outside this workspace. Do not spawn other agents. Use the read, grep, glob and list tools to "
-    "explore; shell commands outside the allowed list are denied, so do not retry a denied command in another "
-    "form. Finish with a final answer that states what you found or changed, the checks you actually ran, and "
-    "anything you are unsure of. Answer in English.\n\n"
+    "or paths outside this workspace. Do not spawn other agents. Explore with the read, grep and glob tools; "
+    "there is no directory-listing tool, so list files with glob (for example the pattern `**/*`). Shell commands "
+    "outside the allowed list are denied, so do not retry a denied command in another form. Finish with a final "
+    "answer that states what you found or changed, the checks you actually ran, and anything you are unsure of. "
+    "Answer in English.\n\n"
 )
 
 
@@ -414,6 +417,8 @@ def classify(digest: dict, returncode: int | None, timed_out: bool) -> tuple[str
         return "FAILED_PROCESS", f"opencode exited {returncode}"
     if not digest["response"].strip():
         return "FAILED_OUTPUT", "Worker produced no final answer"
+    if any(marker in digest["response"] for marker in UNPARSED_TOOL_CALL):
+        return "FAILED_OUTPUT", "Worker ended with an unparsed tool call instead of an answer"
     if digest["denied_actions"]:
         return "PARTIAL_DENIED", f"{len(digest['denied_actions'])} tool call(s) were denied; verify the answer did not depend on them"
     return "SUCCESS", ""
