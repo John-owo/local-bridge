@@ -58,7 +58,8 @@ WORKER_PREAMBLE = (
     "there is no directory-listing tool, so list files with glob (for example the pattern `**/*`). Shell commands "
     "outside the allowed list are denied, so do not retry a denied command in another form. Finish with a final "
     "answer that states what you found or changed, the checks you actually ran, and anything you are unsure of. "
-    "Answer in English.\n\n"
+    "Keep it concise: the reader is another agent that will verify your claims, so give file:line evidence and "
+    "skip restating the task, background explanations and pleasantries. Answer in English.\n\n"
 )
 
 

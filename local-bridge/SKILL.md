@@ -17,7 +17,7 @@ Poor fits: one-line changes, decisions that need the user's context, debugging t
 
 ## Dispatch
 
-1. Run `python BRIDGE doctor` once per session. If `server.ok` is false, run `python BRIDGE server start` (loading takes 1-4 minutes and the model holds most of the GPU and about 20 GB of RAM) and re-check. `server status` also reports other GPU inference servers; `server start` refuses while they run. In Codex, bridge commands require `sandbox_permissions: "require_escalated"`: they reach a localhost server and write run state outside the workspace. CC uses its normal shell permission flow. A shell yielding a session ID means the process is still running: poll that session.
+1. Run `python BRIDGE doctor` once per session. If `server.ok` is false, run `python BRIDGE server start` (loading takes about 40 s to 2 minutes; the model then holds most of the GPU and about 15 GB of RAM, so run `server stop` when the delegated work is done) and re-check. `server status` also reports other GPU inference servers; `server start` refuses while they run. In Codex, bridge commands require `sandbox_permissions: "require_escalated"`: they reach a localhost server and write run state outside the workspace. CC uses its normal shell permission flow. A shell yielding a session ID means the process is still running: poll that session.
 2. Stage only needed files/directories:
 
    ```powershell
