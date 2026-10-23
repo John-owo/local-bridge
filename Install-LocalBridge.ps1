@@ -3,13 +3,20 @@ param(
     [string]$UserRoot = $env:USERPROFILE,
     # Runs and worker state go here; put it on the drive that should take the (small) write load.
     [string]$DataRoot = (Join-Path $env:USERPROFILE 'Documents\Codex'),
-    [string]$Endpoint = 'http://127.0.0.1:8080/v1',
+    # Default backend profile: 'qwen27b' (llama-server) or 'flash-next' (Strata).
+    [ValidateSet('qwen27b', 'flash-next')]
+    [string]$Profile = 'qwen27b',
+    # qwen27b: llama-server from LM Studio's Vulkan runtime and its vendor DLL folder, plus the GGUF model.
+    [string]$LlamaRuntime = (Join-Path $env:USERPROFILE '.lmstudio\extensions\backends\llama.cpp-win-x86_64-vulkan-avx2-2.37.0'),
+    [string]$LlamaVendor = (Join-Path $env:USERPROFILE '.lmstudio\extensions\backends\vendor\win-llama-vulkan-vendor-v2'),
+    [string]$Model = 'E:\LLM\models\unsloth\Qwen3.8-27B-GGUF\Qwen3.8-27B-UD-IQ3_XXS.gguf',
+    # flash-next: Strata's command and `strata launch` arguments. Mapped experts with a 12 GiB RAM tier fit next to
+    # a normal desktop in 40 GB; the full in-RAM arena (about 23 GiB for Coder IQ1_M) does not.
     [string]$Strata = (Join-Path $env:LOCALAPPDATA 'Strata\terminal\current\bin\strata.cmd'),
-    # Arguments for `strata launch` used by `local_bridge.py server start`. Mapped experts with a RAM budget:
-    # the full in-RAM arena (about 23 GiB for Coder IQ1_M) does not fit next to a normal desktop in 40 GB.
-    [string[]]$LaunchArgs = @('--family', 'coder', '--model', 'iq1_m', '--context', '32k', '--vision', 'off', '--access', 'local', '--port', '8080',
-                              '--set', 'mmap-experts', '--set', 'resident-budget-gib=12'),
-    [int]$Context = 32768
+    # Where Strata keeps its model files (about 63 GB); without it Strata defaults to Documents on C:.
+    [string]$StrataDataDir = 'E:\Strata-data',
+    [string[]]$StrataLaunchArgs = @('--family', 'coder', '--model', 'iq1_m', '--context', '32k', '--vision', 'off', '--access', 'local', '--port', '8080',
+                                    '--set', 'mmap-experts', '--set', 'resident-budget-gib=12')
 )
 $ErrorActionPreference = 'Stop'
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -21,7 +28,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $Package 'scripts\local_bridge.py'))
 $Package = (Resolve-Path -LiteralPath $Package).Path
 if (Test-Path -LiteralPath $Canonical) { throw "Skill already exists at $Canonical; inspect before updating." }
 if (Test-Path -LiteralPath $Claude) { throw "Claude skill already exists at $Claude; inspect before updating." }
-if (-not (Test-Path -LiteralPath $Strata)) { Write-Warning "strata command not found at $Strata; server start/stop will be unavailable until the config is fixed." }
+$LlamaServer = Join-Path $LlamaRuntime 'llama-server.exe'
+if (-not (Test-Path -LiteralPath $LlamaServer)) { Write-Warning "llama-server not found at $LlamaServer; the qwen27b profile cannot start its server until the config is fixed." }
+if (-not (Test-Path -LiteralPath $Model)) { Write-Warning "Model not found at $Model." }
+if (-not (Test-Path -LiteralPath $Strata)) { Write-Warning "strata command not found at $Strata; the flash-next profile needs Strata installed first." }
 
 New-Item -ItemType Directory -Path (Split-Path $Canonical -Parent) -Force | Out-Null
 New-Item -ItemType Directory -Path (Split-Path $Claude -Parent) -Force | Out-Null
@@ -37,22 +47,45 @@ $RunsRoot = Join-Path $DataRoot 'local-bridge-runs'
 $StateDir = Join-Path $DataRoot 'local-bridge-state'
 New-Item -ItemType Directory -Path $RunsRoot, $StateDir -Force | Out-Null
 $Config = [ordered]@{
-    endpoint    = $Endpoint
-    model_id    = 'strata'
-    context     = $Context
-    output      = 8192
-    runs_root   = $RunsRoot
-    state_dir   = $StateDir
-    strata      = $Strata
-    launch_args = $LaunchArgs
+    profile   = $Profile
+    runs_root = $RunsRoot
+    state_dir = $StateDir
+    profiles  = [ordered]@{
+        qwen27b      = [ordered]@{
+            endpoint = 'http://127.0.0.1:1234/v1'
+            model_id = 'qwen3.8-27b'
+            context  = 32768
+            output   = 4096
+            # Measured under agent load on 40 GB RAM: --load-mode none keeps the model out of the file cache,
+            # --cache-ram 0 stops the host prompt cache (default 8 GiB) and -np 1 drops three idle slots' host
+            # buffers. Together: RAM working set 17.8 -> 5.7 GB, free RAM 2.7 -> 14.8 GB, same speed. One slot
+            # means concurrent dispatches queue instead of splitting the 32K context.
+            server   = [ordered]@{
+                kind         = 'process'
+                exe          = $LlamaServer
+                path_prepend = @($LlamaVendor, $LlamaRuntime)
+                args         = @('-m', $Model, '-a', 'qwen3.8-27b', '-ngl', '99', '-c', '32768', '-fa', 'auto', '--jinja',
+                                 '--chat-template-kwargs', '{"enable_thinking":false}', '--load-mode', 'none', '--cache-ram', '0', '-np', '1',
+                                 '--host', '127.0.0.1', '--port', '1234')
+            }
+        }
+        'flash-next' = [ordered]@{
+            endpoint = 'http://127.0.0.1:8080/v1'
+            model_id = 'strata'
+            context  = 32768
+            output   = 8192
+            server   = [ordered]@{ kind = 'strata'; strata = $Strata; launch_args = @($StrataLaunchArgs + @('--data-dir', $StrataDataDir)) }
+        }
+    }
 }
 $ConfigPath = Join-Path $Canonical 'local-bridge.config.json'
-[IO.File]::WriteAllText($ConfigPath, ($Config | ConvertTo-Json -Depth 4), $Utf8)
+[IO.File]::WriteAllText($ConfigPath, ($Config | ConvertTo-Json -Depth 6), $Utf8)
 [pscustomobject]@{
     skill        = $Canonical
     claude       = $Claude
     claudeTarget = (Get-Item -LiteralPath $Claude).Target
     config       = $ConfigPath
+    profile      = $Profile
     runsRoot     = $RunsRoot
     stateDir     = $StateDir
 } | ConvertTo-Json -Depth 4

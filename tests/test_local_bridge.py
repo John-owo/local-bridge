@@ -121,8 +121,73 @@ class PermissionTests(unittest.TestCase):
             self.assertEqual(bridge.load_config(path)["endpoint"], "http://x/v1")
 
 
+FAKE_SERVER = """
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'{"data": [{"id": "fake"}]}')
+    def log_message(self, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+"""
+
+
+class ProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.path = self.base / "c.json"
+
+    def write(self, data):
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_profile_overlays_selected_backend_and_validates(self):
+        self.write({"profile": "dense", "state_dir": str(self.base), "profiles": {
+            "dense": {"endpoint": "http://127.0.0.1:1234/v1", "model_id": "qwen", "server": {"kind": "process", "exe": "x.exe"}},
+            "moe": {"endpoint": "http://127.0.0.1:8080/v1", "server": {"kind": "strata", "launch_args": ["--model", "q"]}}}})
+        config = bridge.load_config(self.path)
+        self.assertEqual((config["profile"], config["model_id"], config["server"]["kind"]), ("dense", "qwen", "process"))
+        self.assertEqual(bridge.load_config(self.path, "moe")["endpoint"], "http://127.0.0.1:8080/v1")
+        with patch.dict(bridge.os.environ, {"LOCAL_BRIDGE_PROFILE": "moe"}):
+            self.assertEqual(bridge.load_config(self.path)["profile"], "moe")
+        with self.assertRaisesRegex(bridge.BridgeError, "available: dense, moe"):
+            bridge.load_config(self.path, "missing")
+        self.write({"profile": "a", "profiles": {"a": {"runs_root": "x"}}})
+        with self.assertRaisesRegex(bridge.BridgeError, "runs_root"):
+            bridge.load_config(self.path)
+        self.write({"profile": "a", "profiles": {"a": {"server": {"kind": "process", "exe": "x", "launch_args": []}}}})
+        with self.assertRaisesRegex(bridge.BridgeError, "launch_args"):
+            bridge.load_config(self.path)
+
+    def test_legacy_flat_strata_config_still_loads(self):
+        self.write({"strata": "s.cmd", "launch_args": ["--model", "q"]})
+        config = bridge.load_config(self.path)
+        self.assertEqual(config["server"], {"kind": "strata", "strata": "s.cmd", "launch_args": ["--model", "q"]})
+        self.assertEqual(config["profile"], "")
+
+    @unittest.skipUnless(bridge.os.name == "nt", "detached start and taskkill are Windows paths")
+    def test_process_server_starts_detached_and_stops_by_recorded_pid(self):
+        script = self.base / "fake_server.py"
+        script.write_text(FAKE_SERVER, encoding="utf-8")
+        port = 18000 + bridge.os.getpid() % 1000
+        config = dict(bridge.DEFAULTS, profile="t", state_dir=str(self.base), endpoint=f"http://127.0.0.1:{port}/v1",
+                      server={"kind": "process", "exe": bridge.sys.executable, "args": [str(script), str(port)]})
+        with patch.object(bridge, "gpu_competitors", return_value=[]):
+            started = bridge.server("start", config, 30, False)
+            self.addCleanup(lambda: bridge.server("stop", config, 30, False))
+            self.assertTrue(started["started"], started)
+            self.assertEqual(started["server"]["models"], ["fake"])
+            self.assertTrue(bridge.pid_file(config).is_file())
+            self.assertTrue(bridge.server("start", config, 30, False)["already_running"])
+            stopped = bridge.server("stop", config, 30, False)
+        self.assertTrue(stopped["stopped"], stopped)
+        self.assertFalse(stopped["server"]["ok"])
+        self.assertFalse(bridge.pid_file(config).is_file())
+        self.assertFalse(bridge.server("stop", config, 30, False)["stopped"])  # nothing recorded any more
+
+
 class EventTests(unittest.TestCase):
-    def test_final_answer_is_text_of_last_text_step(self):
+    def test_answer_keeps_text_from_every_step(self):
         raw = "\n".join([
             event("step_start"),
             event("text", text="Let me look."),
@@ -134,7 +199,9 @@ class EventTests(unittest.TestCase):
             "not json",
         ])
         digest = bridge.parse_events(raw)
-        self.assertEqual(digest["response"], "Final answer.")
+        # A full answer followed by one more tool call and a closing remark must not be lost.
+        self.assertEqual(digest["response"], "Let me look.\n\nFinal answer.")
+        self.assertEqual(digest["max_identical_tool_calls"], 1)
         self.assertEqual(digest["steps"], 2)
         self.assertEqual(digest["tokens"], {"input": 120, "output": 40, "reasoning": 4, "cache_read": 55})
         self.assertEqual(bridge.classify(digest, 0, False)[0], "SUCCESS")
@@ -154,6 +221,16 @@ class EventTests(unittest.TestCase):
         errored = bridge.parse_events(json.dumps({"type": "error", "error": {"name": "APIError"}}))
         self.assertEqual(bridge.classify(errored, 1, False)[0], "FAILED_CHILD")
         self.assertEqual(bridge.classify(denied, 0, True)[0], "FAILED_TIMEOUT")
+
+    def test_step_cap_echo_and_read_loop_fail(self):
+        read = event("tool_use", tool="read", state={"status": "completed", "input": {"filePath": "a.py"}, "output": "x"})
+        raw = "\n".join([event("step_start"), *[read] * 7,
+                         event("text", text="CRITICAL - MAXIMUM STEPS REACHED\n\nThe maximum number of steps allowed ...")])
+        digest = bridge.parse_events(raw)
+        self.assertEqual(digest["max_identical_tool_calls"], 7)
+        state, reason = bridge.classify(digest, 0, False)
+        self.assertEqual(state, "FAILED_STEP_LIMIT")
+        self.assertIn("repeated 7 times", reason)
 
 
 if __name__ == "__main__":

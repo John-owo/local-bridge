@@ -22,6 +22,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import Counter
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 CONFIG_PATH = Path(os.environ.get("LOCAL_BRIDGE_CONFIG") or SKILL_DIR / "local-bridge.config.json")
@@ -35,10 +36,18 @@ DEFAULTS = {
     "runs_root": str(Path.home() / "Documents" / "Codex" / "local-bridge-runs"),
     "state_dir": str(Path.home() / ".local-bridge"),
     "opencode": "",
+    # How `server start/stop` manages the model server: {"kind": "process", "exe", "args", "path_prepend"} runs
+    # a server executable such as llama-server; {"kind": "strata", "strata", "launch_args"} drives `strata launch`.
+    "server": {},
+    # Name of the active entry in "profiles" (overridden by --profile or LOCAL_BRIDGE_PROFILE).
+    "profile": "",
+    # Legacy single-backend keys, read as a strata server when "server" is absent.
     "strata": "",
-    # `strata launch` arguments used by `server start`.
     "launch_args": [],
 }
+PROFILE_KEYS = {"endpoint", "model_id", "context", "output", "server"}
+SERVER_KEYS = {"strata": {"kind", "strata", "launch_args"}, "process": {"kind", "exe", "args", "path_prepend"}}
+GPU_SERVER_IMAGES = ("llama-server.exe", "strata.exe", "ollama.exe", "ollama_llama_server.exe", "LM Studio.exe", "lms.exe")
 MAX_FILES = 5000
 MAX_BYTES = 100 * 1024 * 1024
 MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -51,6 +60,9 @@ TIERS = {"routine": ("low", 40), "standard": ("medium", 80), "complex": ("high",
 DENIAL_MARKERS = ("prevents you from using this specific tool call", "auto-rejecting", "permission denied", "rejected permission")
 # Tool-call markup that reached the answer as text: the server did not parse it (often a tool the request never declared).
 UNPARSED_TOOL_CALL = ("<tool_call>", "<function=", "</tool_call>")
+# OpenCode injects this when an agent reaches its step cap; weak models echo it back as their "answer".
+STEP_LIMIT_MARKER = "MAXIMUM STEPS REACHED"
+LOOP_REPEATS = 5
 WORKER_PREAMBLE = (
     "You are an isolated worker running on a local model. Your workspace is the current directory: a copy of "
     "selected project files. Work only inside it. Do not access credentials, the network, the original project, "
@@ -59,7 +71,8 @@ WORKER_PREAMBLE = (
     "outside the allowed list are denied, so do not retry a denied command in another form. Finish with a final "
     "answer that states what you found or changed, the checks you actually ran, and anything you are unsure of. "
     "Keep it concise: the reader is another agent that will verify your claims, so give file:line evidence and "
-    "skip restating the task, background explanations and pleasantries. Answer in English.\n\n"
+    "skip restating the task, background explanations and pleasantries. Concise does not mean selective: report "
+    "every issue you found, marking uncertain ones as uncertain rather than leaving them out. Answer in English.\n\n"
 )
 
 
@@ -77,8 +90,9 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def load_config(path: Path = CONFIG_PATH) -> dict:
+def load_config(path: Path = CONFIG_PATH, profile: str | None = None) -> dict:
     config = dict(DEFAULTS)
+    profiles: dict = {}
     if path.is_file():
         try:
             data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -86,10 +100,33 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
             raise BridgeError(f"Cannot parse {path.name}: {exc}") from exc
         if not isinstance(data, dict):
             raise BridgeError(f"{path.name} must be a JSON object")
-        unknown = set(data) - set(DEFAULTS)
+        unknown = set(data) - set(DEFAULTS) - {"profiles"}
         if unknown:
             raise BridgeError(f"Unknown keys in {path.name}: {', '.join(sorted(unknown))}")
+        profiles = data.pop("profiles", {})
         config.update(data)
+    name = profile or os.environ.get("LOCAL_BRIDGE_PROFILE") or config["profile"]
+    if profiles:
+        if name not in profiles:
+            raise BridgeError(f"Profile {name!r} not found; available: {', '.join(sorted(profiles))}")
+        unknown = set(profiles[name]) - PROFILE_KEYS
+        if unknown:
+            raise BridgeError(f"Unknown keys in profile {name!r}: {', '.join(sorted(unknown))}")
+        config.update(profiles[name])
+    elif name:
+        raise BridgeError(f"Profile {name!r} requested but {path.name} defines no profiles")
+    config["profile"] = name or ""
+    config["profiles"] = sorted(profiles)
+    if not config["server"] and config["launch_args"]:
+        config["server"] = {"kind": "strata", "strata": config["strata"], "launch_args": config["launch_args"]}
+    spec = config["server"]
+    if spec:
+        kind = spec.get("kind")
+        if kind not in SERVER_KEYS:
+            raise BridgeError(f"server.kind must be one of {', '.join(SERVER_KEYS)}")
+        unknown = set(spec) - SERVER_KEYS[kind]
+        if unknown:
+            raise BridgeError(f"Unknown server keys for kind {kind!r}: {', '.join(sorted(unknown))}")
     return config
 
 
@@ -144,12 +181,12 @@ def resolve_opencode(config: dict) -> str:
     raise BridgeError("opencode executable not found; install opencode-ai or set \"opencode\" in local-bridge.config.json")
 
 
-def resolve_strata(config: dict) -> str:
-    if config.get("strata"):
-        candidate = Path(config["strata"])
+def resolve_strata(configured: str = "") -> str:
+    if configured:
+        candidate = Path(configured)
         if candidate.is_file():
             return str(candidate)
-        raise BridgeError(f"Configured strata command not found: {candidate}")
+        raise BridgeError(f"Configured strata command not found: {candidate} (is Strata installed?)")
     found = shutil.which("strata.cmd") or shutil.which("strata")
     if found:
         return found
@@ -370,11 +407,10 @@ def inspect(run_dir: Path) -> dict:
 
 
 def parse_events(raw: str) -> dict:
-    """Digest `opencode run --format json` output: final answer, tool calls, denials, token use."""
+    """Digest `opencode run --format json` output: answer text, tool calls, denials, loops, token use."""
     texts, tools, denials, errors = [], [], [], []
     tokens = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0}
     steps = 0
-    last_text_step = -1
     for line in raw.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -388,9 +424,8 @@ def parse_events(raw: str) -> dict:
         if kind == "step_start":
             steps += 1
         elif kind == "text" and part.get("text", "").strip():
-            if last_text_step != steps:
-                texts = []  # Keep only the text of the latest step that produced any.
-                last_text_step = steps
+            # Keep every step's text: models often write the full answer, make one more tool call, then close
+            # with a one-liner that only points back at it.
             texts.append(part["text"].strip())
         elif kind == "tool_use":
             state = part.get("state") or {}
@@ -406,7 +441,9 @@ def parse_events(raw: str) -> dict:
             tokens["cache_read"] += int((used.get("cache") or {}).get("read") or 0)
         elif kind == "error":
             errors.append(json.dumps(event.get("error"), ensure_ascii=False)[:500])
-    return {"response": "\n\n".join(texts), "tool_calls": tools, "denied_actions": denials, "errors": errors, "steps": steps, "tokens": tokens}
+    repeats = Counter((t["tool"], t["input"]) for t in tools)
+    return {"response": "\n\n".join(texts), "tool_calls": tools, "denied_actions": denials, "errors": errors, "steps": steps,
+            "tokens": tokens, "max_identical_tool_calls": max(repeats.values(), default=0)}
 
 
 def classify(digest: dict, returncode: int | None, timed_out: bool) -> tuple[str, str]:
@@ -420,6 +457,10 @@ def classify(digest: dict, returncode: int | None, timed_out: bool) -> tuple[str
         return "FAILED_OUTPUT", "Worker produced no final answer"
     if any(marker in digest["response"] for marker in UNPARSED_TOOL_CALL):
         return "FAILED_OUTPUT", "Worker ended with an unparsed tool call instead of an answer"
+    if STEP_LIMIT_MARKER in digest["response"]:
+        loop = digest.get("max_identical_tool_calls", 0)
+        return "FAILED_STEP_LIMIT", ("Worker hit the step cap" + (f"; one tool call repeated {loop} times (loop)" if loop >= LOOP_REPEATS else "")
+                                     + ". Narrow the task or raise the tier")
     if digest["denied_actions"]:
         return "PARTIAL_DENIED", f"{len(digest['denied_actions'])} tool call(s) were denied; verify the answer did not depend on them"
     return "SUCCESS", ""
@@ -500,6 +541,7 @@ def run_child(run_dir: Path, task_file: Path, tier: str, mode: str, allow_comman
                   "elapsed_seconds": elapsed, "response": digest["response"] or None, "steps": digest["steps"], "tokens": tokens,
                   "output_tokens_per_second": round(tokens["output"] / elapsed, 1) if elapsed else None,
                   "tool_calls": digest["tool_calls"], "denied_actions": digest["denied_actions"], "errors": digest["errors"],
+                  "max_identical_tool_calls": digest["max_identical_tool_calls"],
                   "changes": inspect(run_dir)["changes"]}
         write_json(run_dir / "result.json", result)
         write_json(status_path, {"state": state, "reason": reason, "selected": selected, "finished_at": time.time()})
@@ -511,7 +553,9 @@ def run_child(run_dir: Path, task_file: Path, tier: str, mode: str, allow_comman
 
 
 def doctor(config: dict) -> dict:
-    report = {"config_path": str(CONFIG_PATH), "config_file_present": CONFIG_PATH.is_file(), "endpoint": config["endpoint"], "runs_root": config["runs_root"]}
+    report = {"config_path": str(CONFIG_PATH), "config_file_present": CONFIG_PATH.is_file(), "profile": config["profile"],
+              "profiles": config["profiles"], "endpoint": config["endpoint"], "model_id": config["model_id"],
+              "server_kind": config["server"].get("kind"), "runs_root": config["runs_root"]}
     ok = True
     try:
         exe = resolve_opencode(config)
@@ -520,10 +564,6 @@ def doctor(config: dict) -> dict:
     except (BridgeError, OSError, subprocess.TimeoutExpired) as exc:
         report["opencode"] = {"error": str(exc)}
         ok = False
-    try:
-        report["strata"] = {"path": resolve_strata(config)}
-    except BridgeError as exc:
-        report["strata"] = {"error": str(exc)}
     report["server"] = server_health(config)
     ok = ok and report["server"]["ok"]
     try:
@@ -537,49 +577,119 @@ def doctor(config: dict) -> dict:
     return report
 
 
-def gpu_competitors() -> list[str]:
-    """Other local inference servers that would compete for VRAM."""
+def running_images() -> dict[int, str]:
     if os.name != "nt":
-        return []
-    names = ("llama-server.exe", "ollama.exe", "ollama_llama_server.exe", "LM Studio.exe", "lms.exe")
+        return {}
     try:
         out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return []
-    found = set()
+        return {}
+    images = {}
     for line in out.splitlines():
-        image = line.split(",", 1)[0].strip('"')
-        if image.lower() in {n.lower() for n in names}:
-            found.add(image)
-    return sorted(found)
+        fields = [f.strip('"') for f in line.split('","')]
+        if len(fields) > 1 and fields[1].isdigit():
+            images[int(fields[1])] = fields[0]
+    return images
+
+
+def gpu_competitors() -> list[str]:
+    """Local inference servers that would compete for VRAM."""
+    wanted = {n.lower() for n in GPU_SERVER_IMAGES}
+    return sorted({image for image in running_images().values() if image.lower() in wanted})
+
+
+def pid_file(config: dict) -> Path:
+    return Path(config["state_dir"]) / f"server-{config['profile'] or 'default'}.json"
+
+
+def wait_healthy(config: dict, wait: int, process: subprocess.Popen | None = None) -> dict:
+    deadline = time.time() + wait
+    health = server_health(config)
+    while not health["ok"] and time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            break
+        time.sleep(3)
+        health = server_health(config)
+    return health
+
+
+def start_process(config: dict, spec: dict, wait: int) -> dict:
+    exe = Path(spec.get("exe", ""))
+    if not exe.is_file():
+        raise BridgeError(f"Server executable not found: {exe}")
+    env = dict(os.environ)
+    if spec.get("path_prepend"):
+        env["PATH"] = os.pathsep.join([*spec["path_prepend"], env.get("PATH", "")])
+    state = Path(config["state_dir"])
+    state.mkdir(parents=True, exist_ok=True)
+    log = state / f"server-{config['profile'] or 'default'}.log"
+    # Detached so the server outlives this command; breakaway keeps it alive when the caller's job object closes.
+    flags = 0x00000008 | 0x00000200 | 0x01000000 if os.name == "nt" else 0
+    with log.open("w", encoding="utf-8") as out:
+        try:
+            process = subprocess.Popen([str(exe), *spec.get("args", [])], env=env, stdout=out, stderr=subprocess.STDOUT,
+                                       stdin=subprocess.DEVNULL, close_fds=True, creationflags=flags, start_new_session=os.name != "nt")
+        except OSError:
+            if os.name != "nt":
+                raise
+            # The caller's job object forbids breakaway; the server then lives only as long as that job.
+            process = subprocess.Popen([str(exe), *spec.get("args", [])], env=env, stdout=out, stderr=subprocess.STDOUT,
+                                       stdin=subprocess.DEVNULL, close_fds=True, creationflags=flags & ~0x01000000)
+    write_json(pid_file(config), {"pid": process.pid, "exe": str(exe), "started_at": time.time()})
+    health = wait_healthy(config, wait, process)
+    if not health["ok"]:
+        tail = log.read_text(encoding="utf-8", errors="replace")[-1500:]
+        return {"started": False, "exit_code": process.poll(), "server": health, "log": str(log), "log_tail": tail}
+    return {"started": True, "pid": process.pid, "server": health, "log": str(log)}
+
+
+def stop_process(config: dict, spec: dict) -> dict:
+    path = pid_file(config)
+    if not path.is_file():
+        return {"stopped": False, "reason": "This server was not started by local-bridge (no pid file); stop it yourself.",
+                "server": server_health(config)}
+    record = json.loads(path.read_text(encoding="utf-8"))
+    image = running_images().get(record["pid"], "")
+    if image.lower() != Path(spec["exe"]).name.lower():
+        path.unlink(missing_ok=True)  # Stale: the process is gone or its pid now belongs to something else.
+        return {"stopped": False, "reason": "Recorded server process is no longer running", "server": server_health(config)}
+    subprocess.run(["taskkill", "/PID", str(record["pid"]), "/T", "/F"], capture_output=True, timeout=30)
+    path.unlink(missing_ok=True)
+    time.sleep(2)
+    return {"stopped": True, "pid": record["pid"], "server": server_health(config)}
 
 
 def server(action: str, config: dict, wait: int, force: bool) -> dict:
     health = server_health(config)
+    spec = config["server"]
     if action == "status":
-        return {"server": health, "gpu_competitors": gpu_competitors()}
-    strata = resolve_strata(config)
+        return {"profile": config["profile"], "server": health, "gpu_competitors": gpu_competitors(),
+                "managed": pid_file(config).is_file()}
+    if not spec:
+        raise BridgeError("This profile defines no server; start and stop the model server yourself")
     if action == "stop":
-        done = subprocess.run([strata, "launch", "--stop"], capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
+        if spec["kind"] == "process":
+            return stop_process(config, spec)
+        done = subprocess.run([resolve_strata(spec.get("strata", "")), "launch", "--stop"], capture_output=True, text=True,
+                              timeout=180, stdin=subprocess.DEVNULL)
         return {"stopped": done.returncode == 0, "output": (done.stdout + done.stderr)[-2000:], "server": server_health(config)}
     if health["ok"]:
         return {"already_running": True, "server": health}
     competitors = gpu_competitors()
     if competitors and not force:
         raise BridgeError(f"Other inference servers hold the GPU: {', '.join(competitors)}. Stop them or pass --force.")
-    if not config["launch_args"]:
-        raise BridgeError("No launch_args in local-bridge.config.json; cannot start the server")
-    args = [strata, "launch", *config["launch_args"], "--no-tui", "--yes"]
+    if spec["kind"] == "process":
+        return start_process(config, spec, wait)
+    if not spec.get("launch_args"):
+        raise BridgeError("No launch_args for the strata server; cannot start it")
+    args = [resolve_strata(spec.get("strata", "")), "launch", *spec["launch_args"], "--no-tui", "--yes"]
     log = Path(config["state_dir"]) / "strata-launch.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("w", encoding="utf-8") as out:
         done = subprocess.run(args, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=max(wait, 60))
-    deadline = time.time() + wait
-    while time.time() < deadline:
-        health = server_health(config)
-        if health["ok"]:
-            return {"started": True, "server": health, "log": str(log)}
-        time.sleep(3)
+    health = wait_healthy(config, wait)
+    if health["ok"]:
+        return {"started": True, "server": health, "log": str(log)}
     return {"started": False, "exit_code": done.returncode, "server": health, "log": str(log)}
 
 
@@ -587,6 +697,7 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", help="backend profile from local-bridge.config.json (default: its \"profile\")")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor")
     p = sub.add_parser("server")
@@ -608,7 +719,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--run-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
-        config = load_config()
+        config = load_config(profile=args.profile)
         if args.command == "doctor":
             report = doctor(config)
             return emit(report, 0 if report["ok"] else 1)

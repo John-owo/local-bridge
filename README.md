@@ -1,6 +1,6 @@
 # local-bridge
 
-讓 Claude Code 與 Codex 把工作派給本機 GPU 上的模型（Strata + Qwen3.8-Flash-Next，經由 OpenCode 執行）的共用技能。
+讓 Claude Code 與 Codex 把工作派給本機 GPU 上的模型（預設 Qwen3.8-27B on llama-server，經由 OpenCode 執行）的共用技能。
 設計沿用 [agy-bridge](https://github.com/John-owo/agy-bridge)：同樣的副本工作流程，只是工人從 Antigravity CLI 換成本機模型。
 
 ## 功能
@@ -14,18 +14,19 @@
 ## 需求
 
 - Windows、Python 3.10+、[OpenCode](https://opencode.ai) 1.18.x（`npm i -g opencode-ai`）。
-- 本機 OpenAI 相容推論伺服器。預設為 [Strata](https://github.com/Niko1221/Strata) 在 `http://127.0.0.1:8080/v1`。
+- 本機 OpenAI 相容推論伺服器，以設定檔（profile）切換：預設 `qwen27b`（LM Studio 附帶的 llama.cpp Vulkan runtime + Qwen3.8-27B GGUF），
+  另有 `flash-next`（[Strata](https://github.com/Niko1221/Strata) + Qwen3.8-Flash-Next，需另外安裝）。
 
 ## 安裝（Windows）
 
 先檢查安裝程式，再於 repository 目錄執行：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Install-LocalBridge.ps1 -DataRoot E:\LLM -Strata E:\Strata\terminal\current\bin\strata.cmd
+powershell -ExecutionPolicy Bypass -File .\Install-LocalBridge.ps1 -DataRoot E:\LLM
 ```
 
 安裝器將技能放入 `~/.agents/skills/local-bridge/`，並在 `~/.claude/skills/local-bridge/` 建立指向同一份技能的目錄連結，
-再寫入 `local-bridge.config.json`（端點、資料夾、`strata launch` 參數）。已有同名技能時會停止，避免覆寫。
+再寫入 `local-bridge.config.json`（資料夾與後端設定檔；`-Profile flash-next` 改預設，`-Model`、`-LlamaRuntime` 指定模型與 runtime）。已有同名技能時會停止，避免覆寫。
 不修改使用者的 OpenCode、Codex 或 Claude Code 設定。
 
 ## 使用
